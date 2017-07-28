@@ -1,47 +1,150 @@
-import vim, os, platform, subprocess, webbrowser, json, re, time
+import os, platform, subprocess, webbrowser, json, re, time
 import sys
-PY2 = int(sys.version[0]) == 2
-if PY2:
-    import urllib2 as request
-    from urllib2 import HTTPError
-else:  # Py3
-    from urllib import request
-    from urllib.error import HTTPError
-
-    def cmp(a, b):
-        if a < b:
-            return -1
-        elif a > b:
-            return 1
-        else:
-            return 0
+import urllib2 as request
+from urllib2 import HTTPError
 
 from itertools import groupby
 
 opener = request.build_opener(request.ProxyHandler({}))
 
+def tern_refs():
+  data = tern_runCommand("refs", fragments=False)
+  if data is None: return
+
+  refs = []
+  for ref in data["refs"]:
+    lnum     = ref["start"]["line"] + 1
+    col      = ref["start"]["ch"] + 1
+    filename = tern_projectFilePath(ref["file"])
+    name     = data["name"]
+    text     = vim.eval("getbufline('" + filename + "'," + str(lnum) + ")")
+    refs.append({"lnum": lnum,
+                 "col": col,
+                 "filename": filename,
+                 "text": name + " (file not loaded)" if len(text)==0 else text[0]})
+  #vim.command("call setloclist(0," + json.dumps(refs) + ") | lopen")
+  return json.dumps(refs)
+
+def tern_lookupType():
+  data = tern_runCommand("type")
+  if data: tern_echoWrap(data.get("type", ""))
+
+def tern_lookupArgumentHints(fname, apos, curRow, curCol):
+  data = tern_runCommand({"type": "type", "preferFunction": True},
+                         {"line": curRow - 1, "ch": apos},
+                         True, True)
+  if data: tern_echoWrap(data.get("type", ""),name=fname)
+
+def tern_lookupDefinition(cmd):
+  data = tern_runCommand("definition", fragments=False)
+  if data is None: return
+
+  if "file" in data:
+    lnum     = data["start"]["line"] + 1
+    col      = data["start"]["ch"] + 1
+    filename = data["file"]
+
+    if cmd == "edit" and filename == tern_relativeFile():
+      vim.command("normal! m`")
+      vim.command("call cursor(" + str(lnum) + "," + str(col) + ")")
+    else:
+      vim.command(cmd + " +call\ cursor(" + str(lnum) + "," + str(col) + ") " +
+        tern_projectFilePath(filename).replace(" ", "\\ "))
+  elif "url" in data:
+    print("see " + data["url"])
+  else:
+    print("no definition found")
+
+def tern_lookupDocumentation(browse=False):
+  data = tern_runCommand("documentation")
+  if data is None: return
+
+  doc = data.get("doc")
+  url = data.get("url")
+  if url:
+    if browse:
+      savout = os.dup(1)
+      os.close(1)
+      os.open(os.devnull, os.O_RDWR)
+      try:
+        result = webbrowser.open(url)
+      finally:
+        os.dup2(savout, 1)
+        return result
+    doc = ((doc and doc + "\n\n") or "") + "See " + url
+  if doc:
+    #vim.command("call tern#PreviewInfo(" + json.dumps(doc, ensure_ascii=False) + ")")
+    return json.dumps(doc,ensure)
+  else:
+    print("no documentation found")
+    return None
+
+def tern_ensureCompletionCached(ternLastCompletionPos, curRow, curCol, curLine,ternRequestQuery,ternCompletionQuery):
+  cached = ternLastCompletionPos
+
+  if (curRow == int(cached["row"]) and curCol >= int(cached["end"]) and
+      curLine[0:int(cached["end"])] == cached["word"] and
+      (not re.match(".*\\W", curLine[int(cached["end"]):curCol]))):
+    return
+
+  if ternCompletionQuery is None:
+    ternCompletionQuery = dict()
+
+  completionQuery = dict({"type": "completions", "types": True, "docs": True}, **ternCompletionQuery)
+
+  data = tern_runCommand(completionQuery, {"line": curRow - 1, "ch": curCol})
+  if data is None: return
+
+  completions = []
+  for rec in data["completions"]:
+    completions.append({"word": rec["name"],
+                        "menu": tern_asCompletionIcon(rec.get("type")),
+                        "info": tern_typeDoc(rec) })
+  #vim.command("let b:ternLastCompletion = " + json.dumps(completions))
+  start, end = (data["start"]["ch"], data["end"]["ch"])
+  #vim.command("let b:ternLastCompletionPos = " + json.dumps({
+  #  "row": curRow,
+  #  "start": start,
+  #  "end": end,
+  #  "word": curLine[0:end]
+  #}))
+  return json.dumps(completions),json.dumps({
+    "row": curRow,
+    "start": start,
+    "end": end,
+    "word": curLine[0:end]
+  }))
+
+def tern_sendBufferIfDirty(ternInsertActiveDefined, ternInsertActive, ternBufferSentAt):
+  if (ternInsertActiveDefined == "1" and
+      ternInsertActive == "0"):
+    curSeq = vim.eval("undotree()['seq_cur']")
+    if curSeq > ternBufferSentAt and tern_sendBuffer():
+      #vim.command("let b:ternBufferSentAt = " + str(curSeq))
+      return str(curSeq)
+    else:
+      return None
+
+def tern_killServers():
+  for project in _tern_projects.values():
+    tern_killServer(project)
+
 def tern_displayError(err):
   print(str(err))
 
-def tern_makeRequest(port, doc, silent=False):
+def tern_makeRequest(port, doc, timeout, silent=False):
   payload = json.dumps(doc)
-  if not PY2:
-    payload = payload.encode('utf-8')
   try:
     localhost = 'localhost'
     if platform.system().lower()=='windows':
         localhost = '127.0.0.1'
     req = opener.open("http://" + localhost + ":" + str(port) + "/", payload,
-                      float(vim.eval("g:tern_request_timeout")))
+                      timeout)
     result = req.read()
-    if not PY2:
-        result = result.decode('utf-8')
     return json.loads(result)
   except HTTPError as error:
     if not silent:
       message = error.read()
-      if not PY2:
-        message = message.decode('utf-8')
       tern_displayError(message)
     return None
 
@@ -59,14 +162,12 @@ class Project(object):
   def __del__(self):
     tern_killServer(self)
 
-def tern_projectDir():
-  cur = vim.eval("b:ternProjectDir")
+def tern_projectDir(ternProjectDir,mydir, pathEnocoding):
+  cur = ternProjectDir
   if cur: return cur
 
   projectdir = ""
-  mydir = vim.eval("expand('%:p:h')")
-  if PY2:
-    mydir = mydir.decode(vim.eval('&encoding'))
+  mydir = mydir.decode(pathEnocoding)
   if not os.path.isdir(mydir): return ""
 
   if mydir:
@@ -80,8 +181,7 @@ def tern_projectDir():
         break
       mydir = parent
 
-  vim.command("let b:ternProjectDir = " + json.dumps(projectdir))
-  return projectdir
+  return (projectdir,json.dumps(projectdir))
 
 def tern_findServer(ignorePort=False):
   dir = tern_projectDir()
@@ -101,7 +201,7 @@ def tern_findServer(ignorePort=False):
       return (port, True)
   return (tern_startServer(project), False)
 
-def tern_startServer(project):
+def tern_startServer(project, ternCommand, ternArgs):
   if time.time() - project.last_failed < 30: return None
 
   win = platform.system() == "Windows"
@@ -109,7 +209,7 @@ def tern_startServer(project):
   if platform.system() == "Darwin":
     env = os.environ.copy()
     env["PATH"] += ":/usr/local/bin"
-  command = vim.eval("g:tern#command") + vim.eval("g:tern#arguments")
+  command = ternCommand + ternArgs
   try:
     proc = subprocess.Popen(command,
                             cwd=project.dir, env=env,
@@ -140,14 +240,9 @@ def tern_killServer(project):
   project.proc.wait()
   project.proc = None
 
-def tern_killServers():
-  for project in _tern_projects.values():
-    tern_killServer(project)
-
-def tern_relativeFile():
-  filename = vim.eval("expand('%:p')")
-  if PY2:
-    filename = filename.decode(vim.eval('&encoding'))
+def tern_relativeFile(bufferPath,encoding):
+  filename = bufferPath
+  filename = filename.decode(encoding)
   if platform.system().lower()=='windows':
     return filename[len(tern_projectDir()) + 1:].replace('\\', '/')
   return filename[len(tern_projectDir()) + 1:]
@@ -159,15 +254,14 @@ def tern_bufferSlice(buf, pos, end):
     pos += 1
   return text
 
-def tern_fullBuffer():
+def tern_fullBuffer(bufferText):
   return {"type": "full",
           "name": tern_relativeFile(),
-          "text": tern_bufferSlice(vim.current.buffer, 0, len(vim.current.buffer))}
+          "text": tern_bufferSlice(bufferText, 0, len(bufferText))}
 
-def tern_bufferFragment():
-  curRow, curCol = vim.current.window.cursor
+def tern_bufferFragment(curRow, curCol, bufferText):
   line = curRow - 1
-  buf = vim.current.buffer
+  buf = bufferText
   minIndent = None
   start = None
 
@@ -185,19 +279,18 @@ def tern_bufferFragment():
           "text": tern_bufferSlice(buf, start, end),
           "offsetLines": start}
 
-def tern_runCommand(query, pos=None, fragments=True, silent=False):
+def tern_runCommand(query, curRow, curCol, ternBufferSentAt, bufferText, ternInsertActive, pos=None, fragments=True, silent=False):
   if isinstance(query, str): query = {"type": query}
   if (pos is None):
-    curRow, curCol = vim.current.window.cursor
     pos = {"line": curRow - 1, "ch": curCol}
   port, portIsOld = tern_findServer()
   if port is None: return
   curSeq = vim.eval("undotree()['seq_cur']")
 
   doc = {"query": query, "files": []}
-  if curSeq == vim.eval("b:ternBufferSentAt"):
+  if curSeq == ternBufferSentAt:
     fname, sendingFile = (tern_relativeFile(), False)
-  elif len(vim.current.buffer) > 250 and fragments:
+  elif len(bufferText) > 250 and fragments:
     f = tern_bufferFragment()
     doc["files"].append(f)
     pos = {"line": pos["line"] - f["offsetLines"], "ch": pos["ch"]}
@@ -226,9 +319,10 @@ def tern_runCommand(query, pos=None, fragments=True, silent=False):
       if not silent:
         tern_displayError(e)
 
-  if sendingFile and vim.eval("b:ternInsertActive") == "0":
-    vim.command("let b:ternBufferSentAt = " + str(curSeq))
-  return data
+  if sendingFile and ternInsertActive == "0":
+    return (data, str(curSeq))
+  else:
+    return (data, None)
 
 def tern_sendBuffer(files=None):
   port, _portIsOld = tern_findServer()
@@ -239,17 +333,10 @@ def tern_sendBuffer(files=None):
   except:
     return False
 
-def tern_sendBufferIfDirty():
-  if (vim.eval("exists('b:ternInsertActive')") == "1" and
-      vim.eval("b:ternInsertActive") == "0"):
-    curSeq = vim.eval("undotree()['seq_cur']")
-    if curSeq > vim.eval("b:ternBufferSentAt") and tern_sendBuffer():
-      vim.command("let b:ternBufferSentAt = " + str(curSeq))
-
-def tern_asCompletionIcon(type):
+def ternasCompletionIcon(type, ternShowSignatureInPum):
   if type is None or type == "?": return "(?)"
   if type.startswith("fn("):
-    if vim.eval("g:tern_show_signature_in_pum") == "0":
+    if ternShowSignatureInPum == "0":
       return "(fn)"
     else:
       return type
@@ -259,41 +346,6 @@ def tern_asCompletionIcon(type):
   if type == "bool": return "(bool)"
   return "(obj)"
 
-def tern_ensureCompletionCached():
-  cached = vim.eval("b:ternLastCompletionPos")
-  curRow, curCol = vim.current.window.cursor
-  curLine = vim.current.buffer[curRow - 1]
-
-  if (curRow == int(cached["row"]) and curCol >= int(cached["end"]) and
-      curLine[0:int(cached["end"])] == cached["word"] and
-      (not re.match(".*\\W", curLine[int(cached["end"]):curCol]))):
-    return
-
-  ternRequestQuery = vim.eval('g:tern_request_query')
-  ternCompletionQuery = ternRequestQuery.get('completions')
-
-  if ternCompletionQuery is None:
-    ternCompletionQuery = dict()
-
-  completionQuery = dict({"type": "completions", "types": True, "docs": True}, **ternCompletionQuery)
-
-  data = tern_runCommand(completionQuery, {"line": curRow - 1, "ch": curCol})
-  if data is None: return
-
-  completions = []
-  for rec in data["completions"]:
-    completions.append({"word": rec["name"],
-                        "menu": tern_asCompletionIcon(rec.get("type")),
-                        "info": tern_typeDoc(rec) })
-  vim.command("let b:ternLastCompletion = " + json.dumps(completions))
-  start, end = (data["start"]["ch"], data["end"]["ch"])
-  vim.command("let b:ternLastCompletionPos = " + json.dumps({
-    "row": curRow,
-    "start": start,
-    "end": end,
-    "word": curLine[0:end]
-  }))
-
 def tern_typeDoc(rec):
   tp = rec.get("type")
   result = rec.get("doc", " ")
@@ -301,87 +353,17 @@ def tern_typeDoc(rec):
      result = tp + "\n" + result
   return result
 
-def tern_lookupDocumentation(browse=False):
-  data = tern_runCommand("documentation")
-  if data is None: return
-
-  doc = data.get("doc")
-  url = data.get("url")
-  if url:
-    if browse:
-      savout = os.dup(1)
-      os.close(1)
-      os.open(os.devnull, os.O_RDWR)
-      try:
-        result = webbrowser.open(url)
-      finally:
-        os.dup2(savout, 1)
-        return result
-    doc = ((doc and doc + "\n\n") or "") + "See " + url
-  if doc:
-    vim.command("call tern#PreviewInfo(" + json.dumps(doc, ensure_ascii=False) + ")")
-  else:
-    print("no documentation found")
-
-def tern_echoWrap(data, name=""):
+def tern_echoWrap(data, name="", columns):
   text = data
   if len(name) > 0:
     text = name+": " + text
-  col = int(vim.eval("&columns"))-23
+  col = int(columns)-23
   if len(text) > col:
     text = text[0:col]+"..."
   print(text.encode('utf-8'))
 
-def tern_lookupType():
-  data = tern_runCommand("type")
-  if data: tern_echoWrap(data.get("type", ""))
-
-def tern_lookupArgumentHints(fname, apos):
-  curRow, curCol = vim.current.window.cursor
-  data = tern_runCommand({"type": "type", "preferFunction": True},
-                         {"line": curRow - 1, "ch": apos},
-                         True, True)
-  if data: tern_echoWrap(data.get("type", ""),name=fname)
-
-def tern_lookupDefinition(cmd):
-  data = tern_runCommand("definition", fragments=False)
-  if data is None: return
-
-  if "file" in data:
-    lnum     = data["start"]["line"] + 1
-    col      = data["start"]["ch"] + 1
-    filename = data["file"]
-
-    if cmd == "edit" and filename == tern_relativeFile():
-      vim.command("normal! m`")
-      vim.command("call cursor(" + str(lnum) + "," + str(col) + ")")
-    else:
-      vim.command(cmd + " +call\ cursor(" + str(lnum) + "," + str(col) + ") " +
-        tern_projectFilePath(filename).replace(" ", "\\ "))
-  elif "url" in data:
-    print("see " + data["url"])
-  else:
-    print("no definition found")
-
 def tern_projectFilePath(path):
   return os.path.join(tern_projectDir(), path)
-
-def tern_refs():
-  data = tern_runCommand("refs", fragments=False)
-  if data is None: return
-
-  refs = []
-  for ref in data["refs"]:
-    lnum     = ref["start"]["line"] + 1
-    col      = ref["start"]["ch"] + 1
-    filename = tern_projectFilePath(ref["file"])
-    name     = data["name"]
-    text     = vim.eval("getbufline('" + filename + "'," + str(lnum) + ")")
-    refs.append({"lnum": lnum,
-                 "col": col,
-                 "filename": filename,
-                 "text": name + " (file not loaded)" if len(text)==0 else text[0]})
-  vim.command("call setloclist(0," + json.dumps(refs) + ") | lopen")
 
 # Copied here because Python 2.6 and lower don't have it built in, and
 # python 3.0 and higher don't support old-style cmp= args to the sort
